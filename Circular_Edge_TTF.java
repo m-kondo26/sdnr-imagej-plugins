@@ -47,11 +47,13 @@ import java.nio.file.Paths;
  * profile. This release adds LSF/TTF calculation from the aligned ESF.</p>
  */
 public class Circular_Edge_TTF implements PlugIn {
-    private static final String VERSION = "2026-05-22-fix13";
+    private static final String VERSION = "2026-09-09-negative-hu-fix";
     protected static final int DEFAULT_CENTER_X = 391;
     protected static final int DEFAULT_CENTER_Y = 386;
     protected static final int DEFAULT_MAX_RADIUS = 60;
     protected static final int DEFAULT_ANGLE_SAMPLES = 360;
+    // Retained for subclass compatibility only. Calibrated HU must not be clipped.
+    @Deprecated
     protected static final double OUTER_MIN_HU = -50.0;
     protected static final double DEFAULT_DIAMETER_MM = 28.0;
     protected static final double DEFAULT_TOLERANCE_MM = 5.0;
@@ -129,7 +131,13 @@ public class Circular_Edge_TTF implements PlugIn {
             }
             ip.setInterpolationMethod(ImageProcessor.BILINEAR);
 
-            SliceResult autoResult = analyzeSlice(ip, cal, width, height, radialLength);
+            SliceResult autoResult;
+            try {
+                autoResult = analyzeSlice(ip, cal, width, height, radialLength);
+            } catch (IllegalArgumentException e) {
+                IJ.error("Edge alignment failed", e.getMessage());
+                break;
+            }
             autoResult.rawPolar.resetMinAndMax();
             autoResult.alignedPolar.resetMinAndMax();
 
@@ -932,35 +940,29 @@ public class Circular_Edge_TTF implements PlugIn {
             }
         }
 
-        int outerLimit = Math.min(maxRadius, Math.max(peakIdx + 1, gradientUpper));
-        while (outerLimit > peakIdx && meanProf[outerLimit] < OUTER_MIN_HU) {
-            outerLimit--;
-        }
-        if (outerLimit <= peakIdx) {
-            outerLimit = Math.min(maxRadius, peakIdx + (int) Math.round(Math.max(1.0, tolerancePx)));
-        }
-        if (outerLimit <= peakIdx) {
-            outerLimit = Math.min(maxRadius, peakIdx + 1);
-        }
+        // Select plateau samples by position, not by their HU sign or magnitude.
+        // The region beyond the edge-search interval is the outer background.
+        int outerLimit = maxRadius;
+        int outerStart = Math.min(maxRadius, Math.max(peakIdx + 1, searchUpper));
+        int innerLimit = searchLower > 0 ? searchLower - 1 : Math.max(0, peakIdx / 2);
 
         int innerMid = (searchLower > 0)
             ? Math.max(0, Math.min(maxRadius, Math.round(searchLower / 2.0f)))
             : Math.max(0, Math.min(maxRadius, Math.round(peakIdx / 2.0f)));
-        int outerMidBase = searchUpper > searchLower ? searchUpper : outerLimit;
-        int outerMid = Math.max(0, Math.min(outerLimit, Math.round((peakIdx + outerMidBase) / 2.0f)));
+        int outerMid = Math.round((outerStart + outerLimit) / 2.0f);
         int win = 5;
         double sumH = 0;
         int cntH = 0;
         double sumL = 0;
         int cntL = 0;
         for (int r = innerMid - win; r <= innerMid + win; r++) {
-            if (r >= 0 && r <= maxRadius) {
+            if (r >= 0 && r <= innerLimit) {
                 sumH += meanProf[r];
                 cntH++;
             }
         }
         for (int r = outerMid - win; r <= outerMid + win; r++) {
-            if (r >= 0 && r <= outerLimit && meanProf[r] >= OUTER_MIN_HU) {
+            if (r >= outerStart && r <= outerLimit) {
                 sumL += meanProf[r];
                 cntL++;
             }
@@ -971,7 +973,7 @@ public class Circular_Edge_TTF implements PlugIn {
             lowPlateau = sumL / cntL;
         } else {
             int fallbackIdx = Math.max(0, Math.min(outerLimit, outerMid));
-            lowPlateau = Math.max(OUTER_MIN_HU, meanProf[fallbackIdx]);
+            lowPlateau = meanProf[fallbackIdx];
         }
 
         double highInt = findInnerPlateauEdgeCrossing(meanProf, highPlateau, peakIdx, 0, droppingEdge);
@@ -1283,14 +1285,20 @@ public class Circular_Edge_TTF implements PlugIn {
         double lowerClipBase = (expectedEdgePx > 0 && tolerancePx > 0)
             ? Math.max(0, expectedEdgePx - Math.max(tolerancePx, 3.0))
             : 0;
+        // Extra fit samples must not expand the user's accepted edge interval.
+        double acceptedLower = (expectedEdgePx > 0 && tolerancePx > 0)
+            ? Math.max(0, expectedEdgePx - tolerancePx) : lowerClipBase;
+        double acceptedUpper = (expectedEdgePx > 0 && tolerancePx > 0)
+            ? Math.min(h - 1, expectedEdgePx + tolerancePx) : upperClipBase;
 
         for (int a = 0; a < w; a++) {
             List<Double> xList = new ArrayList<>();
             List<Double> yList = new ArrayList<>();
             for (int i = 0; i < h; i++) {
                 double val = polar.getf(a, i);
-                if (Double.isNaN(val) || val < OUTER_MIN_HU) {
-                    val = OUTER_MIN_HU;
+                if (!Double.isFinite(val)) {
+                    throw new IllegalArgumentException("Non-finite pixel values in radial profile "
+                        + a + ". Check the image calibration and the ROI.");
                 }
                 rawY[i] = val;
                 if (i >= lowerClipBase && i <= upperClipBase) {
@@ -1307,18 +1315,32 @@ public class Circular_Edge_TTF implements PlugIn {
                     xFit[i] = xList.get(i);
                     yFit[i] = yList.get(i);
                 }
-                CurveFitter cf = new CurveFitter(xFit, yFit);
-                double startLower = yFit[0];
-                double startSlope = yFit[yFit.length - 1] - yFit[0];
-                if (Math.abs(startSlope) < 1e-6) {
-                    startSlope = 1.0;
+                double fitMin = yFit[0];
+                double fitMax = yFit[0];
+                for (double value : yFit) {
+                    fitMin = Math.min(fitMin, value);
+                    fitMax = Math.max(fitMax, value);
                 }
-                cf.setInitialParameters(new double[]{startLower, startSlope, r0, 1.0});
+                if (fitMax - fitMin <= Math.max(1e-12,
+                        8.0 * Math.ulp(Math.max(Math.abs(fitMin), Math.abs(fitMax))))) {
+                    throw new IllegalArgumentException("No edge contrast in radial profile "
+                        + a + ". Check the ROI center, diameter and edge tolerance.");
+                }
+                // An affine normalization leaves the edge position unchanged,
+                // while avoiding optimizer behavior that depends on the HU zero.
+                // Only fitting uses these values; alignment and ESF retain HU.
+                double fitRange = fitMax - fitMin;
+                for (int i = 0; i < yFit.length; i++) {
+                    yFit[i] = (yFit[i] - fitMin) / fitRange;
+                }
+                CurveFitter cf = new CurveFitter(xFit, yFit);
+                // Rodbard parameters are inner level, exponent, radius, outer level.
+                cf.setInitialParameters(new double[]{yFit[0], 10.0, r0, yFit[yFit.length - 1]});
                 try {
                     cf.doFit(CurveFitter.RODBARD);
                     double[] params = cf.getParams();
                     edgePos = params[2];
-                    if (Double.isNaN(edgePos) || edgePos < lowerClipBase || edgePos > upperClipBase) {
+                    if (!Double.isFinite(edgePos) || edgePos < acceptedLower || edgePos > acceptedUpper) {
                         edgePos = Double.NaN;
                     }
                 } catch (Exception e) {
@@ -1327,21 +1349,15 @@ public class Circular_Edge_TTF implements PlugIn {
             }
 
             if (Double.isNaN(edgePos)) {
-                edgePos = estimateEdgeByGradient(rawY);
+                // A failed fit must not align a remote noise fluctuation to a
+                // tolerance boundary. Search only the original edge interval.
+                edgePos = estimateEdgeByGradient(rawY,
+                    (int) Math.ceil(acceptedLower), (int) Math.floor(acceptedUpper));
             }
 
-            if (expectedEdgePx > 0 && tolerancePx > 0 && !Double.isNaN(edgePos)) {
-                double clampLower = Math.max(0, expectedEdgePx - tolerancePx);
-                double clampUpper = Math.min(h - 1, expectedEdgePx + tolerancePx);
-                if (edgePos < clampLower) {
-                    edgePos = clampLower;
-                } else if (edgePos > clampUpper) {
-                    edgePos = clampUpper;
-                }
-            }
-
-            if (Double.isNaN(edgePos)) {
-                edgePos = r0;
+            if (!Double.isFinite(edgePos) || edgePos < acceptedLower || edgePos > acceptedUpper) {
+                throw new IllegalArgumentException("No valid edge position in radial profile "
+                    + a + ". Check the ROI center, diameter and edge tolerance.");
             }
 
             offs[a] = (float) (edgePos - r0);
@@ -1349,7 +1365,13 @@ public class Circular_Edge_TTF implements PlugIn {
         return offs;
     }
 
-    private float estimateEdgeByGradient(double[] profile) {
+    private float estimateEdgeByGradient(double[] fullProfile, int first, int last) {
+        first = Math.max(0, first);
+        last = Math.min(fullProfile.length - 1, last);
+        if (last <= first) {
+            return Float.NaN;
+        }
+        double[] profile = java.util.Arrays.copyOfRange(fullProfile, first, last + 1);
         int n = profile.length;
         if (n < 2) {
             return Float.NaN;
@@ -1373,6 +1395,9 @@ public class Circular_Edge_TTF implements PlugIn {
         }
         double inner = profile[0];
         double outer = profile[n - 1];
+        if (!Double.isFinite(bestDiff) || bestDiff == 0.0) {
+            return Float.NaN;
+        }
         double target = (inner + outer) * 0.5;
         int start = Math.max(0, bestIdx - 3);
         int end = Math.min(n - 2, bestIdx + 3);
@@ -1382,14 +1407,14 @@ public class Circular_Edge_TTF implements PlugIn {
             if (dropping ? (v1 >= target && v2 <= target) : (v1 <= target && v2 >= target)) {
                 double denom = v2 - v1;
                 if (Math.abs(denom) < 1e-6) {
-                    return (float) i;
+                    return (float) (first + i);
                 }
                 double frac = (target - v1) / denom;
                 frac = Math.max(0.0, Math.min(1.0, frac));
-                return (float) (i + frac);
+                return (float) (first + i + frac);
             }
         }
-        return (float) Math.max(0, Math.min(n - 1, bestIdx + 0.5));
+        return (float) (first + Math.max(0, Math.min(n - 1, bestIdx + 0.5)));
     }
 
     private FloatProcessor alignPolarProfiles(FloatProcessor p, float[] offs) {

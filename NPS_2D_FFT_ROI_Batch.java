@@ -2,15 +2,14 @@ import ij.IJ;
 import ij.ImagePlus;
 import ij.WindowManager;
 import ij.gui.GenericDialog;
-import ij.gui.ImageCanvas;
-import ij.gui.ImageRoi;
 import ij.gui.NonBlockingGenericDialog;
 import ij.gui.Overlay;
 import ij.gui.Plot;
 import ij.gui.PlotWindow;
 import ij.gui.Roi;
-import ij.gui.YesNoCancelDialog;
 import ij.io.FileInfo;
+import ij.io.OpenDialog;
+import ij.io.RoiDecoder;
 import ij.io.SaveDialog;
 import ij.measure.Calibration;
 import ij.measure.ResultsTable;
@@ -19,31 +18,30 @@ import ij.process.FHT;
 import ij.process.FloatProcessor;
 import ij.process.ImageProcessor;
 
-import java.awt.Choice;
-import java.awt.Checkbox;
 import java.awt.Color;
 import java.awt.Rectangle;
-import java.awt.TextField;
 import java.awt.Window;
-import java.awt.event.ItemEvent;
-import java.awt.event.ItemListener;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.event.TextEvent;
-import java.awt.event.TextListener;
+import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Vector;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 
 /**
- * Noise power spectrum measurement with a calibrated 2D FFT method.
+ * Batch NPS measurement driven by multiple ImageJ ROI zip entries.
  */
-public class NPS_2D_FFT implements PlugIn {
+public class NPS_2D_FFT_ROI_Batch implements PlugIn {
     private static final String VERSION = "2026-09-09-nps-input-validation";
-    private static final int DEFAULT_ROI_SIZE = 128;
     private static final int FIRST_OUTPUT_BIN = 1;
     private static final String TREND_REMOVAL_QUADRATIC = "2D second-order polynomial (Samei)";
     private static final String TREND_REMOVAL_MEAN = "Subtract ROI mean only";
@@ -57,14 +55,18 @@ public class NPS_2D_FFT implements PlugIn {
 
     @Override
     public void run(String arg) {
-        IJ.log("NPS Calculator " + VERSION + " loaded as class " + getClass().getName());
+        IJ.log("NPS 2D FFT ROI Batch " + VERSION + " loaded as class " + getClass().getName());
         ImagePlus imp = IJ.getImage();
         if (imp == null) {
-            IJ.error("No image", "Open an image first.");
+            IJ.error("No image", "Open an image stack first.");
             return;
         }
         if (imp.getType() == ImagePlus.COLOR_RGB) {
             IJ.error("Unsupported image", "NPS should be calculated from a grayscale CT image.");
+            return;
+        }
+        if (imp.getStackSize() < 1) {
+            IJ.error("No stack", "The current image has no slices.");
             return;
         }
 
@@ -76,48 +78,70 @@ public class NPS_2D_FFT implements PlugIn {
             IJ.error("Invalid NPS geometry", e.getMessage());
             return;
         }
-        while (true) {
-            NpsParameters params = readParameters(imp, geometry);
-            if (params == null) {
-                return;
-            }
-
-            NpsResult result;
-            try {
-                result = computeNps(imp, cal, params);
-            } catch (IllegalArgumentException e) {
-                IJ.error("NPS calculation stopped", e.getMessage() + "\nNo CSV was exported.");
-                clearStatusAndProgress();
-                return;
-            }
-            showSummary(imp, params, result);
-            showNpsPlot(result);
-            boolean csvSaved = exportCsv(result);
-            if (confirmFinishAfterCalculation("NPS", csvSaved)) {
-                return;
-            }
+        BatchParameters params = readBatchParameters(imp, geometry);
+        if (params == null) {
+            return;
         }
+
+        String roiZipPath = chooseRoiZip();
+        if (roiZipPath == null) {
+            return;
+        }
+
+        List<RoiEntry> roiEntries;
+        try {
+            roiEntries = readRoiZip(roiZipPath);
+        } catch (IOException e) {
+            IJ.error("ROI zip read failed", e.getMessage());
+            return;
+        }
+        if (roiEntries.isEmpty()) {
+            IJ.error("No ROI", "The selected zip file does not contain readable ImageJ .roi entries.");
+            return;
+        }
+        assignUniqueDisplayNames(roiEntries);
+
+        List<RoiEntry> validRois = validateRois(roiEntries, imp.getWidth(), imp.getHeight(), params.matrix);
+        if (validRois == null) {
+            clearStatusAndProgress();
+            return;
+        }
+        if (!allSameRoiSize(validRois)) {
+            IJ.error(
+                "Mixed ROI sizes",
+                "All valid ROIs must have the same square size to average NPS directly. Use same-size ROI entries in the ROI zip."
+            );
+            clearStatusAndProgress();
+            return;
+        }
+
+        showMeasuredRoiPreview(imp, validRois);
+        NpsResult result;
+        try {
+            result = computeRoiAveragedNps(imp, cal, params, validRois);
+        } catch (IllegalArgumentException e) {
+            IJ.error("NPS calculation stopped", e.getMessage() + "\nNo workbook was exported.");
+            clearStatusAndProgress();
+            return;
+        }
+        showSummary(imp, params, validRois, result);
+        showNpsPlot(result);
+
+        boolean saved = exportWorkbook(params, result);
+        IJ.log(String.format(
+            Locale.US,
+            "NPS ROI Batch finished: image=%s rois=%d slices=%d export=%s",
+            imp.getTitle(),
+            validRois.size(),
+            params.sliceNumbers.length,
+            saved ? "saved" : "not saved"
+        ));
+        clearStatusAndProgress();
     }
 
-    private NpsParameters readParameters(ImagePlus imp, Geometry geometry) {
-        int width = imp.getWidth();
-        int height = imp.getHeight();
-        int matrixLimit = Math.max(1, geometry.matrix);
-        int defaultRoi = largestPowerOfTwoAtMost(Math.min(Math.min(Math.min(width, height), matrixLimit), DEFAULT_ROI_SIZE));
-        if (defaultRoi < 8) {
-            IJ.error("Image too small", "Image must support at least an 8x8 square ROI.");
-            return null;
-        }
-
-        boolean hasUsableRoi = isUsableSquarePowerOfTwoRoi(imp.getRoi(), width, height, matrixLimit);
-        if (hasUsableRoi) {
-            defaultRoi = imp.getRoi().getBounds().width;
-        }
-        Rectangle defaultBounds = defaultRoiBounds(imp, defaultRoi, hasUsableRoi);
-        double defaultCenterX = defaultBounds.x + defaultBounds.width / 2.0;
-        double defaultCenterY = defaultBounds.y + defaultBounds.height / 2.0;
-        String[] roiSizeChoices = allowedPowerOfTwoRoiSizes(width, height, matrixLimit);
-        GenericDialog gd = new NonBlockingGenericDialog("NPS 2D FFT Parameters");
+    private BatchParameters readBatchParameters(ImagePlus imp, Geometry geometry) {
+        int currentSlice = Math.max(1, Math.min(imp.getCurrentSlice(), imp.getStackSize()));
+        GenericDialog gd = new NonBlockingGenericDialog("NPS ROI Batch Parameters");
         gd.addMessage(String.format(
             Locale.US,
             "Geometry: FOV %.9g mm / matrix %d = %.9g mm/pixel%nSource: %s",
@@ -126,141 +150,278 @@ public class NPS_2D_FFT implements PlugIn {
             geometry.pixelSizeMm,
             geometry.source
         ));
-        gd.addMessage(String.format(
-            Locale.US,
-            "Frequency step uses DICOM-derived pixel size and the FFT ROI length: df = 1 / (ROI size * pixel size).%nFor %d px ROI: df = %.9g cycles/mm.",
-            defaultRoi,
-            1.0 / (defaultRoi * geometry.pixelSizeMm)
-        ));
         if (!geometry.isDicomDerived) {
             gd.addMessage("DICOM FOV/pixel-spacing tags were not found. Confirm or edit FOV and matrix below.");
         }
+        gd.addMessage("After this dialog, select an ImageJ ROI zip. All valid rectangular square power-of-two ROIs will be measured.");
         gd.addNumericField("FOV (mm)", geometry.fovMm, 6);
         gd.addNumericField("Matrix size (pixels)", geometry.matrix, 0);
-        gd.addChoice("Square ROI size (pixels; power of 2, <= matrix)", roiSizeChoices, Integer.toString(defaultRoi));
-        gd.addNumericField("ROI center X (pixels)", defaultCenterX, 2);
-        gd.addNumericField("ROI center Y (pixels)", defaultCenterY, 2);
-        gd.addMessage("Move the cursor over the image to read x/y/value. Click the image to set ROI center X/Y.");
-        gd.addMessage("Current ROI option accepts only a rectangular square ROI whose side length is a power of two; oval/circular ROIs are rejected.");
-        gd.addCheckbox("Use current rectangular square ROI instead of center X/Y", hasUsableRoi);
+        gd.addNumericField("Start slice", currentSlice, 0);
+        gd.addNumericField("End slice", imp.getStackSize(), 0);
+        gd.addNumericField("Slice step", 1, 0);
         gd.addChoice("Trend removal before FFT", TREND_REMOVAL_CHOICES, TREND_REMOVAL_QUADRATIC);
         gd.addCheckbox("Apply 2D Hann window", false);
-        RoiPreviewController preview = installRoiPreview(imp, gd);
-        ImageCoordinateProbe probe = installImageCoordinateProbe(imp, gd, imp.getCalibration(), preview);
         gd.showDialog();
-        if (probe != null) {
-            probe.uninstall();
-        }
-        if (preview != null) {
-            preview.uninstall();
-        }
         if (gd.wasCanceled()) {
             return null;
         }
 
         double enteredFov = gd.getNextNumber();
         double enteredMatrix = gd.getNextNumber();
-        double enteredCenterX = gd.getNextNumber();
-        double enteredCenterY = gd.getNextNumber();
-        String roiSizeChoice = gd.getNextChoice();
-        boolean useCurrentRoi = gd.getNextBoolean();
+        double enteredStart = gd.getNextNumber();
+        double enteredEnd = gd.getNextNumber();
+        double enteredStep = gd.getNextNumber();
         String trendRemoval = gd.getNextChoice();
         boolean useHann = gd.getNextBoolean();
-        if (gd.invalidNumber() || enteredFov <= 0 || enteredMatrix <= 0
+        if (gd.invalidNumber()
+            || enteredFov <= 0 || enteredMatrix <= 0
+            || enteredStart < 1 || enteredEnd < 1 || enteredStep < 1
             || !Double.isFinite(enteredFov) || !Double.isFinite(enteredMatrix)
-            || !Double.isFinite(enteredCenterX) || !Double.isFinite(enteredCenterY)) {
-            IJ.error("Invalid input", "FOV, matrix, and ROI center must be valid numbers.");
+            || !Double.isFinite(enteredStart) || !Double.isFinite(enteredEnd) || !Double.isFinite(enteredStep)) {
+            IJ.error("Invalid input", "FOV, matrix, and slice range must be valid positive numbers.");
             return null;
         }
 
         int matrix = Math.max(1, (int) Math.round(enteredMatrix));
-        int roiSize = Integer.parseInt(roiSizeChoice);
-        Rectangle roiBounds;
-        if (useCurrentRoi) {
-            Roi roi = imp.getRoi();
-            if (!isUsableSquarePowerOfTwoRoi(roi, width, height, matrix)) {
-                IJ.error("Invalid ROI", "Current ROI must be a rectangular square, power-of-two sized, and inside the image. Oval/circular ROIs are not valid for this 2D FFT method.");
-                return null;
-            }
-            roiBounds = roi.getBounds();
-            roiSize = roiBounds.width;
-        } else {
-            if (roiSize > matrix) {
-                IJ.error("Invalid ROI size", "ROI size must not exceed the matrix size.");
-                return null;
-            }
-            if (roiSize > width || roiSize > height) {
-                IJ.error("Invalid ROI size", "ROI size must fit inside the image.");
-                return null;
-            }
-            int x0 = (int) Math.round(enteredCenterX - roiSize / 2.0);
-            int y0 = (int) Math.round(enteredCenterY - roiSize / 2.0);
-            roiBounds = new Rectangle(x0, y0, roiSize, roiSize);
-            if (roiBounds.x < 0 || roiBounds.y < 0 || roiBounds.x + roiSize > width || roiBounds.y + roiSize > height) {
-                IJ.error("Invalid ROI position", "The selected ROI center and size place the ROI outside the image.");
-                return null;
-            }
+        int startSlice = clampSlice((int) Math.round(enteredStart), imp.getStackSize());
+        int endSlice = clampSlice((int) Math.round(enteredEnd), imp.getStackSize());
+        if (endSlice < startSlice) {
+            IJ.error("Invalid slice range", "End slice must be greater than or equal to start slice.");
+            return null;
         }
-
+        int step = Math.max(1, (int) Math.round(enteredStep));
         double pixelSizeMm = enteredFov / matrix;
         boolean unchangedGeometry = nearlyEqual(enteredFov, geometry.fovMm) && matrix == geometry.matrix;
         String source = unchangedGeometry
             ? geometry.source
             : String.format(Locale.US, "Manual dialog input: FOV=%.9g mm, matrix=%d", enteredFov, matrix);
-        return new NpsParameters(
+        return new BatchParameters(
             pixelSizeMm,
             enteredFov,
             matrix,
             geometry.isDicomDerived && unchangedGeometry,
             source,
-            roiBounds,
+            sliceNumbers(startSlice, endSlice, step),
+            startSlice,
+            endSlice,
+            step,
             trendRemoval,
             useHann
         );
     }
 
-    private Rectangle defaultRoiBounds(ImagePlus imp, int defaultRoi, boolean hasUsableRoi) {
-        if (hasUsableRoi) {
-            return imp.getRoi().getBounds();
+    private String chooseRoiZip() {
+        OpenDialog od = new OpenDialog("Open ImageJ ROI zip", null);
+        String fileName = od.getFileName();
+        String directory = od.getDirectory();
+        if (fileName == null || directory == null) {
+            IJ.log("NPS ROI Batch cancelled: ROI zip was not selected.");
+            return null;
         }
-        int x0 = (imp.getWidth() - defaultRoi) / 2;
-        int y0 = (imp.getHeight() - defaultRoi) / 2;
-        return new Rectangle(x0, y0, defaultRoi, defaultRoi);
+        return Paths.get(directory, fileName).toString();
     }
 
-    private RoiPreviewController installRoiPreview(ImagePlus imp, GenericDialog gd) {
-        Vector<?> fields = gd.getNumericFields();
-        Vector<?> choices = gd.getChoices();
-        Vector<?> checkboxes = gd.getCheckboxes();
-        if (fields == null || fields.size() < 4 || choices == null || choices.size() < 1
-            || checkboxes == null || checkboxes.size() < 1) {
-            return null;
+    private List<RoiEntry> readRoiZip(String path) throws IOException {
+        List<RoiEntry> entries = new ArrayList<>();
+        byte[] buffer = new byte[8192];
+        ZipInputStream zis = new ZipInputStream(new FileInputStream(path));
+        try {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory() || !entry.getName().toLowerCase(Locale.US).endsWith(".roi")) {
+                    continue;
+                }
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                int read;
+                while ((read = zis.read(buffer)) >= 0) {
+                    bytes.write(buffer, 0, read);
+                }
+                Roi roi = new RoiDecoder(bytes.toByteArray(), entry.getName()).getRoi();
+                if (roi == null) {
+                    IJ.log("NPS ROI Batch: skipped unreadable ROI entry " + entry.getName());
+                    continue;
+                }
+                String name = roi.getName();
+                if (name == null || name.trim().isEmpty()) {
+                    name = baseName(entry.getName());
+                    roi.setName(name);
+                }
+                entries.add(new RoiEntry(roi, name, entry.getName()));
+            }
+        } finally {
+            zis.close();
         }
-        Choice roiSizeChoice = (Choice) choices.get(0);
-        TextField matrixField = (TextField) fields.get(1);
-        TextField centerXField = (TextField) fields.get(2);
-        TextField centerYField = (TextField) fields.get(3);
-        Checkbox useCurrentRoi = (Checkbox) checkboxes.get(0);
-        RoiPreviewController preview = new RoiPreviewController(imp, roiSizeChoice, matrixField, centerXField, centerYField, useCurrentRoi);
-        preview.install();
-        return preview;
+        return entries;
     }
 
-    private ImageCoordinateProbe installImageCoordinateProbe(ImagePlus imp, GenericDialog gd, Calibration cal, RoiPreviewController preview) {
-        ImageCanvas canvas = imp.getCanvas();
-        if (canvas == null) {
+    private void assignUniqueDisplayNames(List<RoiEntry> entries) {
+        for (int i = 0; i < entries.size(); i++) {
+            RoiEntry current = entries.get(i);
+            boolean duplicate = false;
+            for (int j = 0; j < entries.size(); j++) {
+                if (i != j && current.name.equals(entries.get(j).name)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            current.displayName = duplicate
+                ? current.name + " [" + current.entryName + "]"
+                : current.name;
+        }
+    }
+
+    private List<RoiEntry> validateRois(List<RoiEntry> entries, int width, int height, int matrixLimit) {
+        List<String> invalid = new ArrayList<>();
+        for (RoiEntry entry : entries) {
+            String reason = invalidRoiReason(entry.roi, width, height, matrixLimit);
+            if (reason == null) {
+                continue;
+            }
+            String message = entry.displayName + ": " + reason;
+            invalid.add(message);
+            IJ.log("NPS ROI Batch: invalid ROI " + message);
+        }
+        if (!invalid.isEmpty()) {
+            StringBuilder message = new StringBuilder();
+            message.append("All ROI entries must be rectangular square ROIs whose side length is a power of two, inside the image, and not larger than matrix size.\n\n");
+            int shown = Math.min(invalid.size(), 8);
+            for (int i = 0; i < shown; i++) {
+                message.append("- ").append(invalid.get(i)).append('\n');
+            }
+            if (invalid.size() > shown) {
+                message.append("- ... ").append(invalid.size() - shown).append(" more invalid ROI entries");
+            } else {
+                int last = message.length() - 1;
+                if (last >= 0 && message.charAt(last) == '\n') {
+                    message.deleteCharAt(last);
+                }
+            }
+            IJ.error("Invalid ROI", message.toString());
             return null;
         }
-        Vector<?> fields = gd.getNumericFields();
-        if (fields == null || fields.size() < 4) {
-            return null;
+        IJ.log(String.format(
+            Locale.US,
+            "NPS ROI Batch: accepted %d/%d ROI entries from zip.",
+            entries.size(),
+            entries.size()
+        ));
+        return new ArrayList<>(entries);
+    }
+
+    private String invalidRoiReason(Roi roi, int width, int height, int matrixLimit) {
+        if (roi == null) {
+            return "ROI is null";
         }
-        TextField centerXField = (TextField) fields.get(2);
-        TextField centerYField = (TextField) fields.get(3);
-        ImageCoordinateProbe probe = new ImageCoordinateProbe(imp, canvas, cal, centerXField, centerYField, preview);
-        canvas.addMouseListener(probe);
-        canvas.addMouseMotionListener(probe);
-        return probe;
+        if (roi.getType() != Roi.RECTANGLE || roi.getCornerDiameter() != 0) {
+            return "ROI must be a rectangle without rounded corners";
+        }
+        Rectangle bounds = roi.getBounds();
+        if (bounds.width < 8 || bounds.height < 8) {
+            return "ROI must be at least 8x8 pixels";
+        }
+        if (bounds.width != bounds.height) {
+            return "ROI is not square";
+        }
+        if (!isPowerOfTwo(bounds.width)) {
+            return "ROI side length is not a power of two";
+        }
+        if (bounds.width > matrixLimit) {
+            return "ROI side length is larger than matrix size";
+        }
+        if (bounds.x < 0 || bounds.y < 0 || bounds.x + bounds.width > width || bounds.y + bounds.height > height) {
+            return "ROI is outside the image";
+        }
+        return null;
+    }
+
+    private boolean allSameRoiSize(List<RoiEntry> rois) {
+        if (rois.isEmpty()) {
+            return true;
+        }
+        int expected = rois.get(0).roi.getBounds().width;
+        for (RoiEntry roi : rois) {
+            int size = roi.roi.getBounds().width;
+            if (size != expected) {
+                IJ.log(String.format(
+                    Locale.US,
+                    "NPS ROI Batch: mixed valid ROI sizes are not averaged directly. First ROI size=%d px, ROI %s size=%d px.",
+                    expected,
+                    roi.displayName,
+                    size
+                ));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private NpsResult computeRoiAveragedNps(ImagePlus imp, Calibration cal, BatchParameters params, List<RoiEntry> rois) {
+        if (rois == null || rois.isEmpty()) {
+            throw new IllegalArgumentException("At least one valid NPS ROI is required.");
+        }
+        for (RoiEntry roi : rois) {
+            String reason = invalidRoiReason(roi.roi, imp.getWidth(), imp.getHeight(), params.matrix);
+            if (reason != null) {
+                throw new IllegalArgumentException("ROI " + roi.displayName + ": " + reason);
+            }
+        }
+        if (!allSameRoiSize(rois)) {
+            throw new IllegalArgumentException("All averaged NPS ROIs must have the same size.");
+        }
+        NpsResult first = null;
+        double[][] roiAveragedPerSlice = null;
+
+        for (int i = 0; i < rois.size(); i++) {
+            RoiEntry roi = rois.get(i);
+            IJ.showStatus("NPS ROI Batch: processing " + roi.displayName + " (" + (i + 1) + "/" + rois.size() + ")");
+            IJ.showProgress(i, rois.size());
+            NpsResult roiResult;
+            try {
+                roiResult = computeNps(imp, cal, params.forRoi(roi));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("ROI " + roi.displayName + ": " + e.getMessage(), e);
+            }
+            if (first == null) {
+                first = roiResult;
+                roiAveragedPerSlice = new double[roiResult.perSlice.length][roiResult.frequencies.length];
+            }
+            for (int s = 0; s < roiResult.perSlice.length; s++) {
+                for (int r = 0; r < roiResult.frequencies.length; r++) {
+                    roiAveragedPerSlice[s][r] += roiResult.perSlice[s][r];
+                }
+            }
+        }
+
+        for (int s = 0; s < roiAveragedPerSlice.length; s++) {
+            for (int r = 0; r < roiAveragedPerSlice[s].length; r++) {
+                roiAveragedPerSlice[s][r] /= rois.size();
+                if (!Double.isFinite(roiAveragedPerSlice[s][r])) {
+                    throw new IllegalArgumentException("Nonfinite ROI-averaged NPS at frequency bin " + r + ".");
+                }
+            }
+        }
+
+        double[] sliceAverage = new double[first.frequencies.length];
+        for (int r = 0; r < sliceAverage.length; r++) {
+            for (int s = 0; s < roiAveragedPerSlice.length; s++) {
+                sliceAverage[r] += roiAveragedPerSlice[s][r];
+            }
+            sliceAverage[r] /= roiAveragedPerSlice.length;
+            if (!Double.isFinite(sliceAverage[r])) {
+                throw new IllegalArgumentException("Nonfinite average NPS at frequency bin " + r + ".");
+            }
+        }
+
+        return new NpsResult(
+            first.frequencies,
+            roiAveragedPerSlice,
+            sliceAverage,
+            first.sliceNumbers,
+            first.frequencyStep,
+            first.nyquist,
+            first.parameters,
+            rois.size()
+        );
     }
 
     private void validateNpsInput(ImagePlus imp, NpsParameters params) {
@@ -281,14 +442,18 @@ public class NPS_2D_FFT implements PlugIn {
         if (!Double.isFinite(step) || step <= 0) {
             throw new IllegalArgumentException("The ROI size and pixel size produce an invalid frequency step.");
         }
-        if (imp.getStackSize() < 1) {
-            throw new IllegalArgumentException("At least one image plane is required.");
+        if (params.sliceNumbers == null || params.sliceNumbers.length == 0) {
+            throw new IllegalArgumentException("At least one slice is required.");
+        }
+        for (int slice : params.sliceNumbers) {
+            if (slice < 1 || slice > imp.getStackSize()) {
+                throw new IllegalArgumentException("Slice " + slice + " is outside the image stack.");
+            }
         }
     }
 
     private NpsResult computeNps(ImagePlus imp, Calibration cal, NpsParameters params) {
         validateNpsInput(imp, params);
-        int nSlices = imp.getStackSize();
         int roiSize = params.roiBounds.width;
         int maxRadius = roiSize / 2;
         double pixelAreaMm2 = params.pixelSizeMm * params.pixelSizeMm;
@@ -300,10 +465,11 @@ public class NPS_2D_FFT implements PlugIn {
 
         double[] window = buildHannWindow(roiSize, params.useHannWindow);
         double meanWindowSquared = mean2DWindowSquared(window);
-        double[][] perSlice = new double[nSlices][maxRadius + 1];
+        double[][] perSlice = new double[params.sliceNumbers.length][maxRadius + 1];
         double[] average = new double[maxRadius + 1];
 
-        for (int slice = 1; slice <= nSlices; slice++) {
+        for (int i = 0; i < params.sliceNumbers.length; i++) {
+            int slice = params.sliceNumbers[i];
             FloatProcessor fp;
             try {
                 fp = calibratedRoiToFloat(imp.getStack().getProcessor(slice), cal, params.roiBounds);
@@ -324,18 +490,27 @@ public class NPS_2D_FFT implements PlugIn {
                 if (!Double.isFinite(nps) || nps < 0) {
                     throw new IllegalArgumentException("Slice " + slice + ": nonfinite or negative NPS at frequency bin " + r + ".");
                 }
-                perSlice[slice - 1][r] = nps;
+                perSlice[i][r] = nps;
                 average[r] += nps;
             }
         }
 
         for (int r = 0; r <= maxRadius; r++) {
-            average[r] /= nSlices;
+            average[r] /= params.sliceNumbers.length;
             if (!Double.isFinite(average[r])) {
                 throw new IllegalArgumentException("Nonfinite average NPS at frequency bin " + r + ".");
             }
         }
-        return new NpsResult(frequencies, perSlice, average, frequencyStep, 1.0 / (2.0 * params.pixelSizeMm), params);
+        return new NpsResult(
+            frequencies,
+            perSlice,
+            average,
+            params.sliceNumbers,
+            frequencyStep,
+            1.0 / (2.0 * params.pixelSizeMm),
+            params,
+            1
+        );
     }
 
     private FloatProcessor calibratedRoiToFloat(ImageProcessor ip, Calibration cal, Rectangle roi) {
@@ -377,7 +552,7 @@ public class NPS_2D_FFT implements PlugIn {
     private void subtractSecondOrderPolynomialTrend(FloatProcessor fp) {
         double[] coeff = fitSecondOrderPolynomial(fp);
         if (coeff == null) {
-            IJ.log("NPS: 2D second-order trend fit failed; falling back to ROI mean subtraction.");
+            IJ.log("NPS ROI Batch: 2D second-order trend fit failed; falling back to ROI mean subtraction.");
             subtractMean(fp);
             return;
         }
@@ -551,41 +726,36 @@ public class NPS_2D_FFT implements PlugIn {
         return average;
     }
 
-    private void showSummary(ImagePlus imp, NpsParameters params, NpsResult result) {
+    private void showSummary(ImagePlus imp, BatchParameters params, List<RoiEntry> rois, NpsResult result) {
         ResultsTable rt = ResultsTable.getResultsTable();
         if (rt == null) {
             rt = new ResultsTable();
         }
         rt.incrementCounter();
+        rt.addValue("ROI_Count", rois.size());
         rt.addValue("Slices", result.perSlice.length);
         rt.addValue("PixelSize_mm", params.pixelSizeMm);
         rt.addValue("FOV_mm", params.fovMm);
         rt.addValue("Matrix", params.matrix);
         rt.addValue("Geometry_DICOM_Derived", params.geometryDicomDerived ? 1 : 0);
-        rt.addValue("ROI_X", params.roiBounds.x);
-        rt.addValue("ROI_Y", params.roiBounds.y);
-        rt.addValue("ROI_Size_px", params.roiBounds.width);
+        rt.addValue("ROI_Size_px", rois.get(0).roi.getBounds().width);
         rt.addValue("Quadratic_Trend_Removed", TREND_REMOVAL_QUADRATIC.equals(params.trendRemoval) ? 1 : 0);
         rt.addValue("Mean_Subtracted", TREND_REMOVAL_NONE.equals(params.trendRemoval) ? 0 : 1);
         rt.addValue("Hann_Window_Applied", params.useHannWindow ? 1 : 0);
-        rt.addValue("FFT_Length_mm", params.roiBounds.width * params.pixelSizeMm);
+        rt.addValue("FFT_Length_mm", rois.get(0).roi.getBounds().width * params.pixelSizeMm);
         rt.addValue("FrequencyStep_cycles_per_mm", result.frequencyStep);
         rt.addValue("Nyquist_cycles_per_mm", result.nyquist);
         rt.show("Results");
 
         IJ.log(String.format(
             Locale.US,
-            "NPS: image=%s slices=%d ROI=%dx%d at (%d,%d) pixel=%.9f mm FOV=%.6f mm matrix=%d FFT length=%.9f mm df=1/(ROI*pixel)=%.9f cy/mm Nyquist=%.9f cy/mm trend=%s source=%s",
+            "NPS ROI Batch: image=%s rois=%d slices=%d ROI size=%dx%d pixel=%.9f mm df=%.9f cy/mm Nyquist=%.9f cy/mm trend=%s source=%s",
             imp.getTitle(),
+            rois.size(),
             result.perSlice.length,
-            params.roiBounds.width,
-            params.roiBounds.height,
-            params.roiBounds.x,
-            params.roiBounds.y,
+            rois.get(0).roi.getBounds().width,
+            rois.get(0).roi.getBounds().height,
             params.pixelSizeMm,
-            params.fovMm,
-            params.matrix,
-            params.roiBounds.width * params.pixelSizeMm,
             result.frequencyStep,
             result.nyquist,
             params.trendRemoval,
@@ -593,24 +763,53 @@ public class NPS_2D_FFT implements PlugIn {
         ));
     }
 
+    private void showMeasuredRoiPreview(ImagePlus imp, List<RoiEntry> rois) {
+        Overlay overlay = new Overlay();
+        for (int i = 0; i < rois.size(); i++) {
+            RoiEntry entry = rois.get(i);
+            try {
+                Rectangle bounds = entry.roi.getBounds();
+                Roi measured = new Roi(bounds.x, bounds.y, bounds.width, bounds.height);
+                measured.setName("NPS measured ROI: " + entry.displayName);
+                measured.setStrokeColor(roiColor(i, rois.size()));
+                measured.setStrokeWidth(2.0);
+                measured.setPosition(0);
+                overlay.add(measured);
+            } catch (RuntimeException e) {
+                IJ.log("NPS ROI Batch: ROI overlay skipped for " + entry.displayName + ": " + e.getMessage());
+            }
+        }
+        imp.setOverlay(overlay);
+        imp.updateAndDraw();
+        IJ.log("NPS ROI Batch ROI preview shown on the image. Colored rectangles mark all measured ROIs and are visible on every stack slice.");
+    }
+
+    private Color roiColor(int index, int total) {
+        if (total <= 1) {
+            return Color.YELLOW;
+        }
+        float hue = (float) ((index * 0.61803398875) % 1.0);
+        return Color.getHSBColor(hue, 0.84f, 0.95f);
+    }
+
     private void showNpsPlot(NpsResult result) {
         int start = firstOutputBin(result);
         int count = result.frequencies.length - start;
         if (count <= 0) {
-            IJ.log("NPS plot skipped: no non-zero frequency bins available.");
+            IJ.log("NPS ROI Batch plot skipped: no non-zero frequency bins available.");
             return;
         }
 
         double[] yRange = positiveNpsRange(result, start);
         if (yRange == null) {
-            IJ.log("NPS plot skipped: no positive non-zero frequency NPS values available for logarithmic display.");
+            IJ.log("NPS ROI Batch plot skipped: no positive non-zero frequency NPS values available for logarithmic display.");
             return;
         }
 
-        String title = "NPS 2D FFT";
+        String title = "NPS ROI Batch";
         closeWindowByTitle(title);
         Plot plot = new Plot(title, "Spatial frequency (cycles/mm)", "NPS (HU^2 mm^2)");
-        plot.setFrameSize(720, 420);
+        plot.setFrameSize(760, 440);
         plot.setAxisYLog(true);
         plot.setLimits(0.0, result.nyquist, yRange[0], yRange[1]);
         plot.setLineWidth(1);
@@ -626,7 +825,7 @@ public class NPS_2D_FFT implements PlugIn {
         if (window != null) {
             window.toFront();
         }
-        IJ.log("NPS plot shown with per-slice solid curves and a thick average curve. The 0 cycles/mm DC bin is omitted from data and CSV output, while the x-axis starts at 0 cycles/mm.");
+        IJ.log("NPS ROI Batch plot shown: thin colored curves are ROI-averaged per-slice NPS; thick black curve is the slice-average NPS. The 0 cycles/mm DC bin is omitted from data and Excel output, while the x-axis starts at 0 cycles/mm.");
     }
 
     private double[] positiveNpsRange(NpsResult result, int start) {
@@ -689,39 +888,6 @@ public class NPS_2D_FFT implements PlugIn {
         }
     }
 
-    private boolean exportCsv(NpsResult result) {
-        SaveDialog sd = new SaveDialog("Save NPS CSV", "NPS_2DFFT_results", ".csv");
-        String dir = sd.getDirectory();
-        String name = sd.getFileName();
-        if (dir == null || name == null) {
-            IJ.log("NPS CSV export cancelled.");
-            clearStatusAndProgress();
-            return false;
-        }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("Frequency_cycles_per_mm");
-        for (int s = 1; s <= result.perSlice.length; s++) {
-            sb.append(",Slice").append(s).append("_NPS_HU2_mm2");
-        }
-        sb.append(",Average_NPS_HU2_mm2\n");
-        for (int r = firstOutputBin(result); r < result.frequencies.length; r++) {
-            sb.append(String.format(Locale.US, "%.9f", result.frequencies[r]));
-            for (int s = 0; s < result.perSlice.length; s++) {
-                sb.append(',').append(String.format(Locale.US, "%.12g", result.perSlice[s][r]));
-            }
-            sb.append(',').append(String.format(Locale.US, "%.12g", result.average[r])).append('\n');
-        }
-        IJ.saveString(sb.toString(), dir + name);
-        IJ.log("NPS CSV saved: " + dir + name);
-        clearStatusAndProgress();
-        return true;
-    }
-
-    private int firstOutputBin(NpsResult result) {
-        return result != null && result.frequencies.length > FIRST_OUTPUT_BIN ? FIRST_OUTPUT_BIN : 0;
-    }
-
     private void closeWindowByTitle(String title) {
         Window existing = WindowManager.getWindow(title);
         if (existing != null) {
@@ -729,16 +895,206 @@ public class NPS_2D_FFT implements PlugIn {
         }
     }
 
-    private boolean confirmFinishAfterCalculation(String analysisName, boolean csvSaved) {
-        String csvStatus = csvSaved ? "CSVは保存済みです。" : "CSVは保存されていません。";
-        YesNoCancelDialog dialog = new YesNoCancelDialog(
-            IJ.getInstance(),
-            analysisName + " calculation finished",
-            "計算が完了しました。\n" + csvStatus + "\n" + analysisName + "をここで終了してよいですか？\n\n「続ける」またはキャンセルでは、次のROI/条件の入力に戻ります。",
-            "終了",
-            "続ける"
+    private boolean exportWorkbook(BatchParameters params, NpsResult result) {
+        SaveDialog sd = new SaveDialog(
+            "Save NPS ROI Batch Excel workbook",
+            "NPS_2DFFT_ROIavg" + result.roiCount + "_slices" + params.startSlice + "-" + params.endSlice,
+            ".xlsx"
         );
-        return dialog.yesPressed();
+        String fileName = sd.getFileName();
+        String directory = sd.getDirectory();
+        if (fileName == null || directory == null) {
+            IJ.log("NPS ROI Batch Excel export cancelled.");
+            return false;
+        }
+
+        Path workbookPath = Paths.get(directory, ensureXlsxExtension(fileName));
+        try {
+            writeXlsxWorkbook(workbookPath, result);
+            IJ.log("NPS ROI Batch Excel workbook saved to " + workbookPath.toString());
+            return true;
+        } catch (IOException e) {
+            IJ.error("Export failed", e.getMessage());
+            return false;
+        }
+    }
+
+    private void writeXlsxWorkbook(Path path, NpsResult result) throws IOException {
+        ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(path));
+        try {
+            putZipEntry(zip, "[Content_Types].xml", contentTypesXml());
+            putZipEntry(zip, "_rels/.rels", rootRelationshipsXml());
+            putZipEntry(zip, "xl/workbook.xml", workbookXml());
+            putZipEntry(zip, "xl/_rels/workbook.xml.rels", workbookRelationshipsXml());
+            putZipEntry(zip, "xl/worksheets/sheet1.xml", npsSheetXml(result));
+        } finally {
+            zip.close();
+        }
+    }
+
+    private void putZipEntry(ZipOutputStream zip, String name, String text) throws IOException {
+        zip.putNextEntry(new ZipEntry(name));
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        zip.write(bytes, 0, bytes.length);
+        zip.closeEntry();
+    }
+
+    private String contentTypesXml() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+            + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+            + "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+            + "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+            + "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+            + "</Types>";
+    }
+
+    private String rootRelationshipsXml() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+            + "</Relationships>";
+    }
+
+    private String workbookXml() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            + "<sheets>"
+            + "<sheet name=\"NPS\" sheetId=\"1\" r:id=\"rId1\"/>"
+            + "</sheets>"
+            + "</workbook>";
+    }
+
+    private String workbookRelationshipsXml() {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+            + "</Relationships>";
+    }
+
+    private String npsSheetXml(NpsResult result) {
+        int start = firstOutputBin(result);
+        StringBuilder sb = new StringBuilder();
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+          .append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">")
+          .append("<sheetData>");
+
+        appendNpsHeaderRow(sb, result.sliceNumbers);
+        int row = 2;
+        for (int r = start; r < result.frequencies.length; r++) {
+            sb.append("<row r=\"").append(row).append("\">");
+            appendNumberCell(sb, row, 1, result.frequencies[r]);
+            appendNumberCell(sb, row, 2, result.average[r]);
+            for (int s = 0; s < result.sliceNumbers.length; s++) {
+                appendNumberCell(sb, row, s + 3, result.perSlice[s][r]);
+            }
+            sb.append("</row>");
+            row++;
+        }
+
+        sb.append("</sheetData></worksheet>");
+        return sb.toString();
+    }
+
+    private void appendNpsHeaderRow(StringBuilder sb, int[] sliceNumbers) {
+        sb.append("<row r=\"1\">");
+        appendInlineStringCell(sb, 1, 1, "Spatial_frequency_cycles_per_mm");
+        appendInlineStringCell(sb, 1, 2, "Average_NPS_HU2_mm2");
+        for (int s = 0; s < sliceNumbers.length; s++) {
+            appendInlineStringCell(sb, 1, s + 3, "Slice_" + sliceNumbers[s] + "_NPS_HU2_mm2");
+        }
+        sb.append("</row>");
+    }
+
+    private void appendInlineStringCell(StringBuilder sb, int row, int col, String value) {
+        sb.append("<c r=\"").append(cellRef(row, col)).append("\" t=\"inlineStr\"><is><t>")
+          .append(xmlEscape(value))
+          .append("</t></is></c>");
+    }
+
+    private void appendNumberCell(StringBuilder sb, int row, int col, double value) {
+        sb.append("<c r=\"").append(cellRef(row, col)).append("\">");
+        if (Double.isFinite(value)) {
+            sb.append("<v>").append(numberCell(value)).append("</v>");
+        }
+        sb.append("</c>");
+    }
+
+    private String cellRef(int row, int col) {
+        return columnName(col) + row;
+    }
+
+    private String columnName(int col) {
+        StringBuilder sb = new StringBuilder();
+        int value = col;
+        while (value > 0) {
+            int rem = (value - 1) % 26;
+            sb.insert(0, (char) ('A' + rem));
+            value = (value - 1) / 26;
+        }
+        return sb.toString();
+    }
+
+    private String xmlEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch == '&') {
+                sb.append("&amp;");
+            } else if (ch == '<') {
+                sb.append("&lt;");
+            } else if (ch == '>') {
+                sb.append("&gt;");
+            } else if (ch == '"') {
+                sb.append("&quot;");
+            } else if (ch >= 0x20 || ch == '\t' || ch == '\n' || ch == '\r') {
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
+    }
+
+    private String numberCell(double value) {
+        return Double.isNaN(value) || Double.isInfinite(value)
+            ? ""
+            : String.format(Locale.US, "%.12g", value);
+    }
+
+    private String ensureXlsxExtension(String fileName) {
+        return fileName.toLowerCase(Locale.US).endsWith(".xlsx") ? fileName : fileName + ".xlsx";
+    }
+
+    private int firstOutputBin(NpsResult result) {
+        return result != null && result.frequencies.length > FIRST_OUTPUT_BIN ? FIRST_OUTPUT_BIN : 0;
+    }
+
+    private int clampSlice(int slice, int stackSize) {
+        return Math.max(1, Math.min(stackSize, slice));
+    }
+
+    private int[] sliceNumbers(int startSlice, int endSlice, int step) {
+        int count = ((endSlice - startSlice) / step) + 1;
+        int[] slices = new int[count];
+        int value = startSlice;
+        for (int i = 0; i < count; i++) {
+            slices[i] = value;
+            value += step;
+        }
+        return slices;
+    }
+
+    private String baseName(String entryName) {
+        String normalized = entryName.replace('\\', '/');
+        int slash = normalized.lastIndexOf('/');
+        String name = slash >= 0 ? normalized.substring(slash + 1) : normalized;
+        if (name.toLowerCase(Locale.US).endsWith(".roi")) {
+            name = name.substring(0, name.length() - 4);
+        }
+        return name;
     }
 
     private void clearStatusAndProgress() {
@@ -963,41 +1319,6 @@ public class NPS_2D_FFT implements PlugIn {
         return rawStart;
     }
 
-    private boolean isUsableSquarePowerOfTwoRoi(Roi roi, int width, int height, int matrixLimit) {
-        if (roi == null) {
-            return false;
-        }
-        if (roi.getType() != Roi.RECTANGLE || roi.getCornerDiameter() != 0) {
-            return false;
-        }
-        Rectangle bounds = roi.getBounds();
-        return bounds.width == bounds.height
-            && bounds.width >= 8
-            && bounds.width <= matrixLimit
-            && isPowerOfTwo(bounds.width)
-            && bounds.x >= 0
-            && bounds.y >= 0
-            && bounds.x + bounds.width <= width
-            && bounds.y + bounds.height <= height;
-    }
-
-    private String[] allowedPowerOfTwoRoiSizes(int width, int height, int matrixLimit) {
-        int max = largestPowerOfTwoAtMost(Math.min(Math.min(width, height), Math.max(1, matrixLimit)));
-        List<String> sizes = new ArrayList<>();
-        for (int size = 8; size <= max; size *= 2) {
-            sizes.add(Integer.toString(size));
-        }
-        return sizes.toArray(new String[0]);
-    }
-
-    private int largestPowerOfTwoAtMost(int value) {
-        int power = 1;
-        while (power * 2 <= value) {
-            power *= 2;
-        }
-        return power;
-    }
-
     private boolean isPowerOfTwo(int value) {
         return value > 0 && (value & (value - 1)) == 0;
     }
@@ -1009,277 +1330,6 @@ public class NPS_2D_FFT implements PlugIn {
     private boolean nearlyEqual(double a, double b) {
         double tolerance = Math.max(1e-6, Math.max(Math.abs(a), Math.abs(b)) * 1e-4);
         return Math.abs(a - b) <= tolerance;
-    }
-
-    private static Rectangle roiPreviewBounds(Roi currentRoi, boolean useCurrentRoi, Rectangle enteredBounds) {
-        return useCurrentRoi ? (currentRoi == null ? null : currentRoi.getBounds()) : enteredBounds;
-    }
-
-    private static class RoiPreviewController implements TextListener, ItemListener {
-        private final ImagePlus imp;
-        private final Choice roiSizeChoice;
-        private final TextField matrixField;
-        private final TextField centerXField;
-        private final TextField centerYField;
-        private final Overlay originalOverlay;
-        private final Checkbox useCurrentRoi;
-        private boolean updatingChoice = false;
-
-        RoiPreviewController(ImagePlus imp, Choice roiSizeChoice, TextField matrixField, TextField centerXField, TextField centerYField, Checkbox useCurrentRoi) {
-            this.imp = imp;
-            this.roiSizeChoice = roiSizeChoice;
-            this.matrixField = matrixField;
-            this.centerXField = centerXField;
-            this.centerYField = centerYField;
-            this.originalOverlay = imp.getOverlay();
-            this.useCurrentRoi = useCurrentRoi;
-        }
-
-        void install() {
-            roiSizeChoice.addItemListener(this);
-            useCurrentRoi.addItemListener(this);
-            matrixField.addTextListener(this);
-            centerXField.addTextListener(this);
-            centerYField.addTextListener(this);
-            updateFromFields();
-        }
-
-        void uninstall() {
-            roiSizeChoice.removeItemListener(this);
-            useCurrentRoi.removeItemListener(this);
-            matrixField.removeTextListener(this);
-            centerXField.removeTextListener(this);
-            centerYField.removeTextListener(this);
-            imp.setOverlay(originalOverlay);
-            imp.updateAndDraw();
-        }
-
-        @Override
-        public void textValueChanged(TextEvent e) {
-            updateFromFields();
-        }
-
-        @Override
-        public void itemStateChanged(ItemEvent e) {
-            updateFromFields();
-        }
-
-        void updateFromFields() {
-            updateRoiSizeChoices();
-            Rectangle rect = currentRectangle();
-            if (rect == null) {
-                imp.setOverlay(originalOverlay);
-                imp.updateAndDraw();
-                return;
-            }
-
-            boolean inside = rect.x >= 0
-                && rect.y >= 0
-                && rect.x + rect.width <= imp.getWidth()
-                && rect.y + rect.height <= imp.getHeight();
-            Roi roi = new Roi(rect.x, rect.y, rect.width, rect.height);
-            roi.setName("NPS ROI preview");
-            roi.setStrokeColor(inside ? Color.YELLOW : Color.RED);
-            roi.setStrokeWidth(2.0);
-            Overlay overlay = originalOverlay == null ? new Overlay() : originalOverlay.duplicate();
-            addThumbnailPreview(overlay, rect, inside);
-            overlay.add(roi);
-            imp.setOverlay(overlay);
-            imp.updateAndDraw();
-        }
-
-        private void updateRoiSizeChoices() {
-            if (updatingChoice) {
-                return;
-            }
-            int matrixLimit = currentMatrixLimit();
-            if (matrixLimit < 8) {
-                return;
-            }
-            String[] allowed = allowedPowerOfTwoRoiSizes(imp.getWidth(), imp.getHeight(), matrixLimit);
-            if (allowed.length == 0) {
-                return;
-            }
-            String selected = roiSizeChoice.getSelectedItem();
-            if (choiceItemsEqual(roiSizeChoice, allowed)) {
-                return;
-            }
-            updatingChoice = true;
-            roiSizeChoice.removeAll();
-            int selectedValue = parsePositiveInt(selected, Integer.parseInt(allowed[allowed.length - 1]));
-            String replacement = allowed[0];
-            for (String value : allowed) {
-                roiSizeChoice.add(value);
-                if (Integer.parseInt(value) <= selectedValue) {
-                    replacement = value;
-                }
-            }
-            roiSizeChoice.select(replacement);
-            updatingChoice = false;
-        }
-
-        private int currentMatrixLimit() {
-            return parsePositiveInt(matrixField.getText(), Math.min(imp.getWidth(), imp.getHeight()));
-        }
-
-        private boolean choiceItemsEqual(Choice choice, String[] allowed) {
-            if (choice.getItemCount() != allowed.length) {
-                return false;
-            }
-            for (int i = 0; i < allowed.length; i++) {
-                if (!allowed[i].equals(choice.getItem(i))) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private int parsePositiveInt(String text, int fallback) {
-            try {
-                int value = (int) Math.round(Double.parseDouble(text));
-                return value > 0 ? value : fallback;
-            } catch (NumberFormatException e) {
-                return fallback;
-            }
-        }
-
-        private static String[] allowedPowerOfTwoRoiSizes(int width, int height, int matrixLimit) {
-            int max = 1;
-            int bound = Math.min(Math.min(width, height), Math.max(1, matrixLimit));
-            while (max * 2 <= bound) {
-                max *= 2;
-            }
-            List<String> sizes = new ArrayList<>();
-            for (int size = 8; size <= max; size *= 2) {
-                sizes.add(Integer.toString(size));
-            }
-            return sizes.toArray(new String[0]);
-        }
-
-        private void addThumbnailPreview(Overlay overlay, Rectangle rect, boolean inside) {
-            Rectangle imageBounds = new Rectangle(0, 0, imp.getWidth(), imp.getHeight());
-            Rectangle cropBounds = rect.intersection(imageBounds);
-            if (cropBounds.isEmpty()) {
-                return;
-            }
-
-            int thumbnailSize = Math.max(32, Math.min(128, Math.min(imp.getWidth(), imp.getHeight()) / 5));
-            Rectangle thumbnailBounds = thumbnailBounds(thumbnailSize, rect);
-            try {
-                ImageProcessor processor = imp.getProcessor().duplicate();
-                processor.setMinAndMax(imp.getDisplayRangeMin(), imp.getDisplayRangeMax());
-                processor.setRoi(cropBounds);
-                ImageProcessor thumbnail = processor.crop().resize(thumbnailSize, thumbnailSize, true).convertToByte(true).convertToRGB();
-                ImageRoi thumbnailRoi = new ImageRoi(thumbnailBounds.x, thumbnailBounds.y, thumbnail);
-                thumbnailRoi.setName("NPS ROI thumbnail");
-                overlay.add(thumbnailRoi);
-
-                Roi border = new Roi(thumbnailBounds.x, thumbnailBounds.y, thumbnailBounds.width, thumbnailBounds.height);
-                border.setName("NPS ROI thumbnail border");
-                border.setStrokeColor(inside ? Color.YELLOW : Color.RED);
-                border.setStrokeWidth(2.0);
-                overlay.add(border);
-            } catch (RuntimeException e) {
-                // Keep the ROI rectangle preview even if a display-specific thumbnail conversion fails.
-            }
-        }
-
-        private Rectangle thumbnailBounds(int thumbnailSize, Rectangle selectedRoi) {
-            int margin = Math.max(4, thumbnailSize / 12);
-            Rectangle[] candidates = new Rectangle[] {
-                new Rectangle(imp.getWidth() - thumbnailSize - margin, margin, thumbnailSize, thumbnailSize),
-                new Rectangle(margin, margin, thumbnailSize, thumbnailSize),
-                new Rectangle(imp.getWidth() - thumbnailSize - margin, imp.getHeight() - thumbnailSize - margin, thumbnailSize, thumbnailSize),
-                new Rectangle(margin, imp.getHeight() - thumbnailSize - margin, thumbnailSize, thumbnailSize)
-            };
-            for (Rectangle candidate : candidates) {
-                if (!candidate.intersects(selectedRoi)) {
-                    return candidate;
-                }
-            }
-            return candidates[0];
-        }
-
-        private Rectangle currentRectangle() {
-            if (useCurrentRoi.getState()) {
-                return roiPreviewBounds(imp.getRoi(), true, null);
-            }
-            try {
-                int size = Integer.parseInt(roiSizeChoice.getSelectedItem());
-                double centerX = Double.parseDouble(centerXField.getText());
-                double centerY = Double.parseDouble(centerYField.getText());
-                int x0 = (int) Math.round(centerX - size / 2.0);
-                int y0 = (int) Math.round(centerY - size / 2.0);
-                return roiPreviewBounds(imp.getRoi(), false, new Rectangle(x0, y0, size, size));
-            } catch (NumberFormatException e) {
-                return null;
-            }
-        }
-    }
-
-    private static class ImageCoordinateProbe extends MouseAdapter {
-        private final ImagePlus imp;
-        private final ImageCanvas canvas;
-        private final Calibration cal;
-        private final TextField centerXField;
-        private final TextField centerYField;
-        private final RoiPreviewController preview;
-
-        ImageCoordinateProbe(ImagePlus imp, ImageCanvas canvas, Calibration cal, TextField centerXField, TextField centerYField, RoiPreviewController preview) {
-            this.imp = imp;
-            this.canvas = canvas;
-            this.cal = cal;
-            this.centerXField = centerXField;
-            this.centerYField = centerYField;
-            this.preview = preview;
-        }
-
-        void uninstall() {
-            canvas.removeMouseListener(this);
-            canvas.removeMouseMotionListener(this);
-        }
-
-        @Override
-        public void mouseMoved(MouseEvent e) {
-            report(e, false);
-        }
-
-        @Override
-        public void mouseClicked(MouseEvent e) {
-            if (e.isPopupTrigger() || e.getButton() != MouseEvent.BUTTON1) {
-                return;
-            }
-            report(e, true);
-        }
-
-        private void report(MouseEvent e, boolean setCenter) {
-            int x = canvas.offScreenX(e.getX());
-            int y = canvas.offScreenY(e.getY());
-            if (x < 0 || y < 0 || x >= imp.getWidth() || y >= imp.getHeight()) {
-                return;
-            }
-            double raw = imp.getProcessor().getf(x, y);
-            double value = cal != null ? cal.getCValue(raw) : raw;
-            if (setCenter) {
-                centerXField.setText(Integer.toString(x));
-                centerYField.setText(Integer.toString(y));
-                if (preview != null) {
-                    preview.updateFromFields();
-                }
-            }
-            String message = String.format(
-                Locale.US,
-                "NPS ROI probe: x=%d, y=%d, value=%.3f%s",
-                x,
-                y,
-                value,
-                setCenter ? " -> ROI center" : ""
-            );
-            IJ.showStatus(message);
-            if (setCenter) {
-                IJ.log(message);
-            }
-        }
     }
 
     private static class Geometry {
@@ -1298,6 +1348,64 @@ public class NPS_2D_FFT implements PlugIn {
         }
     }
 
+    private static class RoiEntry {
+        final Roi roi;
+        final String name;
+        final String entryName;
+        String displayName;
+
+        RoiEntry(Roi roi, String name, String entryName) {
+            this.roi = roi;
+            this.name = name;
+            this.entryName = entryName;
+            this.displayName = name;
+        }
+    }
+
+    private static class BatchParameters {
+        final double pixelSizeMm;
+        final double fovMm;
+        final int matrix;
+        final boolean geometryDicomDerived;
+        final String geometrySource;
+        final int[] sliceNumbers;
+        final int startSlice;
+        final int endSlice;
+        final int sliceStep;
+        final String trendRemoval;
+        final boolean useHannWindow;
+
+        BatchParameters(double pixelSizeMm, double fovMm, int matrix, boolean geometryDicomDerived,
+                        String geometrySource, int[] sliceNumbers, int startSlice, int endSlice,
+                        int sliceStep, String trendRemoval, boolean useHannWindow) {
+            this.pixelSizeMm = pixelSizeMm;
+            this.fovMm = fovMm;
+            this.matrix = matrix;
+            this.geometryDicomDerived = geometryDicomDerived;
+            this.geometrySource = geometrySource;
+            this.sliceNumbers = sliceNumbers;
+            this.startSlice = startSlice;
+            this.endSlice = endSlice;
+            this.sliceStep = sliceStep;
+            this.trendRemoval = trendRemoval;
+            this.useHannWindow = useHannWindow;
+        }
+
+        NpsParameters forRoi(RoiEntry roi) {
+            return new NpsParameters(
+                pixelSizeMm,
+                fovMm,
+                matrix,
+                geometryDicomDerived,
+                geometrySource,
+                roi.roi.getBounds(),
+                sliceNumbers,
+                trendRemoval,
+                useHannWindow
+            );
+        }
+    }
+
     private static class NpsParameters {
         final double pixelSizeMm;
         final double fovMm;
@@ -1305,17 +1413,20 @@ public class NPS_2D_FFT implements PlugIn {
         final boolean geometryDicomDerived;
         final String geometrySource;
         final Rectangle roiBounds;
+        final int[] sliceNumbers;
         final String trendRemoval;
         final boolean useHannWindow;
 
         NpsParameters(double pixelSizeMm, double fovMm, int matrix, boolean geometryDicomDerived,
-                      String geometrySource, Rectangle roiBounds, String trendRemoval, boolean useHannWindow) {
+                      String geometrySource, Rectangle roiBounds, int[] sliceNumbers,
+                      String trendRemoval, boolean useHannWindow) {
             this.pixelSizeMm = pixelSizeMm;
             this.fovMm = fovMm;
             this.matrix = matrix;
             this.geometryDicomDerived = geometryDicomDerived;
             this.geometrySource = geometrySource;
             this.roiBounds = roiBounds;
+            this.sliceNumbers = sliceNumbers;
             this.trendRemoval = trendRemoval;
             this.useHannWindow = useHannWindow;
         }
@@ -1325,18 +1436,22 @@ public class NPS_2D_FFT implements PlugIn {
         final double[] frequencies;
         final double[][] perSlice;
         final double[] average;
+        final int[] sliceNumbers;
         final double frequencyStep;
         final double nyquist;
         final NpsParameters parameters;
+        final int roiCount;
 
-        NpsResult(double[] frequencies, double[][] perSlice, double[] average,
-                  double frequencyStep, double nyquist, NpsParameters parameters) {
+        NpsResult(double[] frequencies, double[][] perSlice, double[] average, int[] sliceNumbers,
+                  double frequencyStep, double nyquist, NpsParameters parameters, int roiCount) {
             this.frequencies = frequencies;
             this.perSlice = perSlice;
             this.average = average;
+            this.sliceNumbers = sliceNumbers;
             this.frequencyStep = frequencyStep;
             this.nyquist = nyquist;
             this.parameters = parameters;
+            this.roiCount = roiCount;
         }
     }
 }
